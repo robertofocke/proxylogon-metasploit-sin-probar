@@ -25,7 +25,7 @@ that allows an attacker bypassing the authentication and impersonating as the ad
         ],
       'DisclosureDate' => 'March 12 2021',
       'License'        => MSF_LICENSE,
-      'Platform'       => ['windows'],
+      'Platform'       => 'win',
       'Arch'           => [ARCH_X86, ARCH_X64],
       'Privileged'     => false,
       'DefaultOptions' => {
